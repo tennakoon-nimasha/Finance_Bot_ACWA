@@ -1,0 +1,8 @@
+openai
+pandas
+numpy
+pathlib
+matplotlib
+streamlit
+python-dotenv
+psycopg2
