@@ -359,7 +359,7 @@ def create_database_context_index(refresh_cache=False):
     
     # Connect to the database
     try:
-        conn = psycopg2.connect(DB_URL, sslmode='require')
+        conn = psycopg2.connect(DB_URL, sslmode='require', options="-c AddressFamily=ipv4")
     except Exception as e:
         # Fallback to minimal context if DB connection fails
         return create_minimal_context_index(str(e))
@@ -686,7 +686,7 @@ def execute_sql_query(sql_query):
     """
     try:
         # Connect to PostgreSQL database
-        conn = psycopg2.connect(DB_URL, sslmode='require')
+        conn = psycopg2.connect(DB_URL, sslmode='require', options="-c AddressFamily=ipv4")
  
         with conn:
             with conn.cursor() as cur:
