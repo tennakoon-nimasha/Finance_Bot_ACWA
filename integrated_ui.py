@@ -2,7 +2,7 @@ import os
 import json
 import pandas as pd
 import streamlit as st
-import openai
+from openai import OpenAI
 import re
 import psycopg2
 from urllib.parse import urlparse
@@ -75,7 +75,7 @@ header {visibility: hidden;}
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPASBASE_CONNECTION_STRING = os.getenv("SUPASBASE_CONNECTION_STRING")
-DB_URL = "postgresql://postgres.unqxbmnirztfjlkxnrqp:.vb9EKz9jr_8p$h@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
+DB_URL = SUPASBASE_CONNECTION_STRING
 
 # Initialize session state for chat history and settings
 if 'messages' not in st.session_state:
@@ -91,9 +91,9 @@ if 'reasoning_effort' not in st.session_state:
 if 'token_usage' not in st.session_state:
     st.session_state.token_usage = {}
 
-client = wrap_openai(openai.Client())
+client = OpenAI()
 
-@traceable
+# @traceable
 def call_llm(prompt):
     """
     Enhanced call_llm function that supports both standard and reasoning models
