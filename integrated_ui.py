@@ -411,27 +411,39 @@ def execute_sql_query(sql_query):
     """
     Executes a SQL query and returns the results
     """
+    conn = None
     try:
-        # Connect to PostgreSQL database
-        conn = psycopg2.connect(DB_URL, sslmode='require')
+        # Connect to PostgreSQL database with additional parameters to fix IPv6 issues
+        conn = psycopg2.connect(
+            DB_URL, 
+            sslmode='require',
+            options="-c AddressFamily=ipv4",  # Force IPv4 connections
+            connect_timeout=10  # Add a connection timeout
+        )
  
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(sql_query)
-                results = cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(sql_query)
+            results = cur.fetchall()
                
-                # Get column names
-                column_names = [desc[0] for desc in cur.description]
+            # Get column names
+            column_names = [desc[0] for desc in cur.description]
                
-                # Create a list of dictionaries for the dataframe
-                rows = []
-                for row in results:
-                    rows.append(dict(zip(column_names, row)))
+            # Create a list of dictionaries for the dataframe
+            rows = []
+            for row in results:
+                rows.append(dict(zip(column_names, row)))
                
-                return rows, None
+            return rows, None
  
     except Exception as e:
         return None, str(e)
+    finally:
+        # Ensure connection is always closed properly
+        if conn is not None:
+            try:
+                conn.close()
+            except:
+                pass
  
 def generate_insights(user_query, sql_query, data):
     """
