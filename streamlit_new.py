@@ -2,14 +2,14 @@ import os
 import json
 import pandas as pd
 import streamlit as st
-import openai
+from openai import OpenAI
 import re
 import psycopg2
 from urllib.parse import urlparse
 import time
 
-from langsmith.wrappers import wrap_openai
-from langsmith import traceable
+# from langsmith.wrappers import wrap_openai
+# from langsmith import traceable
  
 # Load environment variables
 from dotenv import load_dotenv
@@ -79,9 +79,9 @@ if 'processing' not in st.session_state:
 if 'process_state' not in st.session_state:
     st.session_state.process_state = 0
  
-client = wrap_openai(openai.Client())
-
-@traceable
+# client = wrap_openai(openai.Client())
+client =OpenAI()
+# @traceable
 def call_llm(prompt, reason_model=False):
     # Initialize OpenAI client
     
@@ -301,7 +301,7 @@ def create_database_context_index(refresh_cache=False):
     
     # Connect to the database
     try:
-        conn = psycopg2.connect(DB_URL, sslmode='require')
+        conn = psycopg2.connect(DB_URL, sslmode='require',options="-c AddressFamily=ipv4")
     except Exception as e:
         # Fallback to minimal context if DB connection fails
         return create_minimal_context_index(str(e))
@@ -634,7 +634,7 @@ def execute_sql_query(sql_query):
     """
     try:
         # Connect to PostgreSQL database
-        conn = psycopg2.connect(DB_URL, sslmode='require')
+        conn = psycopg2.connect(DB_URL, sslmode='require', options="-c AddressFamily=ipv4")
  
         with conn:
             with conn.cursor() as cur:
