@@ -2,28 +2,26 @@ import os
 import json
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
+import openai
 import re
 import psycopg2
 from urllib.parse import urlparse
 import time
 
-# from langsmith.wrappers import wrap_openai
-# from langsmith import traceable
+from langsmith.wrappers import wrap_openai
+from langsmith import traceable
  
 # Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
 
-
- 
 # Set page config
 st.set_page_config(
     page_title="Financial Insights Assistant",
     page_icon="💰",
     layout="wide"
 )
- 
+
 # Apply custom styling
 st.markdown("""
 <style>
@@ -59,59 +57,121 @@ st.markdown("""
     border-left: 4px solid #ffc107;
 }
 
+.model-info-box {
+    background-color: #f1f8e9;
+    border-radius: 5px;
+    padding: 10px;
+    margin: 10px 0;
+    border-left: 4px solid #8bc34a;
+}
+
 /* Hide default Streamlit elements */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
- 
+
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPASBASE_CONNECTION_STRING = os.getenv("SUPASBASE_CONNECTION_STRING")
 DB_URL = "postgresql://postgres.unqxbmnirztfjlkxnrqp:.vb9EKz9jr_8p$h@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
- 
-# Initialize session state for chat history
+
+# Initialize session state for chat history and settings
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 if 'processing' not in st.session_state:
     st.session_state.processing = False
 if 'process_state' not in st.session_state:
     st.session_state.process_state = 0
- 
-# client = wrap_openai(openai.Client())
-client =OpenAI()
-# @traceable
-def call_llm(prompt, reason_model=False):
-    # Initialize OpenAI client
-    
-    if reason_model == True:
-        response = client.responses.create(
-            model="o4-mini",
-            reasoning={"effort": "medium"},
-            input=[
-                {
-                    "role": "user", 
-                    "content": prompt
-                }
-            ]
-        )
+if 'model' not in st.session_state:
+    st.session_state.model = "gpt-4.1"
+if 'reasoning_effort' not in st.session_state:
+    st.session_state.reasoning_effort = "medium"
+if 'token_usage' not in st.session_state:
+    st.session_state.token_usage = {}
 
-        return response
-    else:
+client = wrap_openai(openai.Client())
+
+@traceable
+def call_llm(prompt):
+    """
+    Enhanced call_llm function that supports both standard and reasoning models
+    """
+    # Get settings from session state
+    model = st.session_state.model
+    reasoning_effort = st.session_state.reasoning_effort
+    
+    # Determine if this is a reasoning model
+    reasoning_models = ["o4-mini", "o3-mini"]
+    is_reasoning_model = model in reasoning_models
+    
+    if is_reasoning_model:
+        try:
+            # Use the responses.create API for reasoning models
+            response = client.responses.create(
+                model=model,
+                reasoning={"effort": reasoning_effort},
+                input=[
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ]
+            )
+            
+            # Store token usage statistics
+            if hasattr(response, 'usage'):
+                st.session_state.token_usage = {
+                    'input_tokens': response.usage.input_tokens,
+                    'output_tokens': response.usage.output_tokens,
+                    'total_tokens': response.usage.total_tokens
+                }
+                
+                # Add reasoning tokens if available
+                if hasattr(response.usage, 'output_tokens_details') and hasattr(response.usage.output_tokens_details, 'reasoning_tokens'):
+                    st.session_state.token_usage['reasoning_tokens'] = response.usage.output_tokens_details.reasoning_tokens
+            
+            # Format response to be compatible with the rest of the code
+            formatted_response = type('obj', (object,), {
+                'choices': [
+                    type('obj', (object,), {
+                        'message': type('obj', (object,), {
+                            'content': response.output_text,
+                            'thinking': '' # Reasoning models don't have thinking attribute
+                        })
+                    })
+                ]
+            })
+            
+            return formatted_response
+        except Exception as e:
+            st.error(f"Error calling reasoning model: {str(e)}")
+            # Fallback to GPT-4.1 if there's an error
+            st.warning("Falling back to GPT-4.1 due to error with reasoning model.")
+            model = "gpt-4.1"
+            is_reasoning_model = False
+    
+    if not is_reasoning_model:
+        # Use the standard chat completions API for non-reasoning models
         response = client.chat.completions.create(
-            # model="anthropic/claude-3.7-sonnet:thinking",
-            model="gpt-4o",
-            # max_tokens=1000,
+            model=model,
             temperature=0,
             messages=[
                 {"role": "user", "content": prompt}
             ]
         )
-
+        
+        # Store token usage statistics
+        if hasattr(response, 'usage'):
+            st.session_state.token_usage = {
+                'input_tokens': response.usage.prompt_tokens,
+                'output_tokens': response.usage.completion_tokens,
+                'total_tokens': response.usage.total_tokens
+            }
+        
         return response
 
- 
 # Agent prompts
 REASONING_AGENT_PROMPT = """
 You are a specialized financial data analyst. Your task is to:
@@ -121,7 +181,7 @@ You are a specialized financial data analyst. Your task is to:
 3. Create a detailed, step-by-step reasoning plan for how to answer the query with SQL
 
 ## Guidelines:
-- We are working with a single PostgreSQL table named 'structured_rag'
+- We are working with a single PostgreSQL table named 'acwa_finance'
 - Break down the problem into clear logical steps
 - Identify which columns from the schema will be needed
 - Explain any calculations, aggregations, or filtering that will be required
@@ -144,8 +204,6 @@ Each step should be clear and build on the previous ones to form a complete plan
 
 USER QUERY: {user_query}
 
-DATABASE SCHEMA:
-{db_schema}
 
 DATABASE CONTEXT INDEX:
 {db_context_index}
@@ -159,7 +217,7 @@ You are a specialized SQL query generation assistant for financial data. Your ta
 3. Generate complete and executable PostgreSQL SQL code
 
 ## Guidelines:
-- We are working with a single PostgreSQL table named 'structured_rag'
+- We are working with a single PostgreSQL table named 'acwa_finance'
 - Use advanced SQL operations (GROUP BY, CASE WHEN, etc.) as outlined in the reasoning plan
 - ALL data processing must be done within the SQL query itself - do not rely on any post-processing
 - Format and structure your query results to directly answer the question
@@ -232,13 +290,13 @@ Guidelines:
  
 Your response should read as if a financial advisor is providing an analysis, not a technical explanation of data.
 """
- 
+
 def get_db_schema():
     """
-    Returns a formatted string describing the structured_rag table schema.
+    Returns a formatted string describing the acwa_finance table schema.
     """
     # Since we're working with a fixed schema, we can simply return it directly
-    return """Table: structured_rag
+    return """Table: acwa_finance
     "File Name" (text)
     "Month" (text)
     "Ledger Name" (text)
@@ -270,11 +328,11 @@ def get_db_schema():
     "Total Debit_1" (text)
     "Total Credit_1" (text)
     "Closing Balance_1" (text)"""
- 
+
 def create_database_context_index(refresh_cache=False):
     """
     Creates a comprehensive context index of the database with real data.
-    Extracts column names, data types, and unique values for categorical columns.
+    Extracts column names, data types, and unique values for all potentially important columns.
     Uses caching to avoid repeated expensive queries.
     
     Args:
@@ -301,7 +359,7 @@ def create_database_context_index(refresh_cache=False):
     
     # Connect to the database
     try:
-        conn = psycopg2.connect(DB_URL, sslmode='require',options="-c AddressFamily=ipv4")
+        conn = psycopg2.connect(DB_URL, sslmode='require')
     except Exception as e:
         # Fallback to minimal context if DB connection fails
         return create_minimal_context_index(str(e))
@@ -309,7 +367,7 @@ def create_database_context_index(refresh_cache=False):
     try:
         # Dictionary to store all the context data
         context_data = {
-            "table_name": "structured_rag",
+            "table_name": "acwa_finance",
             "columns": {},
             "categorical_values": {},
             "numeric_stats": {},
@@ -321,7 +379,7 @@ def create_database_context_index(refresh_cache=False):
             cur.execute("""
                 SELECT column_name, data_type, is_nullable 
                 FROM information_schema.columns 
-                WHERE table_name = 'structured_rag'
+                WHERE table_name = 'acwa_finance'
                 ORDER BY ordinal_position
             """)
             columns_info = cur.fetchall()
@@ -333,52 +391,48 @@ def create_database_context_index(refresh_cache=False):
                     "nullable": is_nullable
                 }
             
-            # 2. Identify likely categorical columns
-            categorical_columns = []
-            numeric_columns = []
+            # 2. Get row count for reference
+            cur.execute("SELECT COUNT(*) FROM acwa_finance")
+            total_count = cur.fetchone()[0]
             
-            for col_name, data_type, _ in columns_info:
-                # Skip columns that are clearly not categorical
-                if data_type.startswith('int') or data_type.startswith('float') or data_type.startswith('numeric'):
-                    numeric_columns.append(col_name)
-                    continue
-                    
-                # Check cardinality for text columns
-                cur.execute(f"""
-                    SELECT COUNT(DISTINCT "{col_name}") 
-                    FROM structured_rag 
-                    WHERE "{col_name}" IS NOT NULL
-                """)
-                distinct_count = cur.fetchone()[0]
-                
-                # Check if column has row count info
-                cur.execute(f"""
-                    SELECT COUNT(*) 
-                    FROM structured_rag
-                """)
-                total_count = cur.fetchone()[0]
-                
-                # Categorical if distinct values are less than 5% of total rows or less than 100
-                if distinct_count < min(total_count * 0.05, 100):
-                    categorical_columns.append(col_name)
+            # 3. Identify important categorical and financial columns
+            # List of columns that we consider important for financial analysis
+            important_columns = [
+                "Entity", "Entity Name", "Business Line", "Business Line Name", 
+                "Account Grouping", "Account Name", "Period Name", "Currency", 
+                "Intercompany", "Intercompany Name", "Region", "Region Description",
+                "Month", "Ledger Name", "File Name", "Cost Center", "Cost Center Name",
+                "Project", "Project Name", "Analytical Code", "Analytical Code Name"
+            ]
             
-            # 3. Get unique values for categorical columns
-            for col_name in categorical_columns:
-                cur.execute(f"""
-                    SELECT DISTINCT "{col_name}" 
-                    FROM structured_rag 
-                    WHERE "{col_name}" IS NOT NULL 
-                    ORDER BY "{col_name}"
-                    LIMIT 50  -- Limit to prevent huge result sets
-                """)
-                values = [row[0] for row in cur.fetchall()]
-                
-                if values:  # Only add if we have values
-                    context_data["categorical_values"][col_name] = values
+            # Get unique values for important columns
+            for col_name in important_columns:
+                if col_name in context_data["columns"]:
+                    try:
+                        # Get all distinct values for this column
+                        cur.execute(f"""
+                            SELECT DISTINCT "{col_name}" 
+                            FROM acwa_finance 
+                            WHERE "{col_name}" IS NOT NULL 
+                            ORDER BY "{col_name}"
+                        """)
+                        values = [row[0] for row in cur.fetchall()]
+                        
+                        if values:  # Only add if we have values
+                            context_data["categorical_values"][col_name] = values
+                    except Exception as e:
+                        print(f"Error fetching values for {col_name}: {str(e)}")
+                        # Continue with other columns if one fails
+                        continue
             
             # 4. Get statistics for numeric/financial columns
-            # Closing Balance might be stored as text but contains numeric data
-            for col_name in ["Closing Balance", "Opening Balance", "Total Debit", "Total Credit"]:
+            # Important financial columns that might contain numeric data
+            financial_columns = [
+                "Closing Balance", "Opening Balance", "Total Debit", "Total Credit",
+                "Closing Balance_1", "Opening Balance_1", "Total Debit_1", "Total Credit_1"
+            ]
+            
+            for col_name in financial_columns:
                 if col_name in context_data["columns"]:
                     try:
                         cur.execute(f"""
@@ -387,7 +441,7 @@ def create_database_context_index(refresh_cache=False):
                                 MAX(CAST("{col_name}" AS NUMERIC)),
                                 AVG(CAST("{col_name}" AS NUMERIC)),
                                 PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST("{col_name}" AS NUMERIC))
-                            FROM structured_rag
+                            FROM acwa_finance
                             WHERE "{col_name}" ~ '^-?[0-9]*\\.?[0-9]+$'
                         """)
                         min_val, max_val, avg_val, median = cur.fetchone()
@@ -399,9 +453,10 @@ def create_database_context_index(refresh_cache=False):
                                 "avg": float(avg_val) if avg_val is not None else None,
                                 "median": float(median) if median is not None else None
                             }
-                    except Exception:
+                    except Exception as e:
+                        print(f"Error fetching stats for {col_name}: {str(e)}")
                         # Skip if we have issues with this column
-                        pass
+                        continue
         
         # 5. Add domain-specific financial interpretations
         context_data["financial_interpretations"] = {
@@ -440,6 +495,7 @@ def create_database_context_index(refresh_cache=False):
 def format_context_as_markdown(context_data):
     """
     Formats the context data dictionary as a markdown string for AI prompt.
+    Includes ALL values for categorical columns without truncation.
     """
     md_sections = ["# Database Context Index"]
     
@@ -451,22 +507,18 @@ def format_context_as_markdown(context_data):
     for col_name, info in context_data["columns"].items():
         md_sections.append(f"- \"{col_name}\" ({info['data_type']})")
     
-    # Categorical values
+    # Categorical values - Include ALL values without truncation
     md_sections.append("\n## Categorical Column Values")
     for col_name, values in context_data["categorical_values"].items():
-        # Limit number of values displayed to keep prompt concise
-        display_values = values[:20]  # Show only first 20
-        more_indicator = "..." if len(values) > 20 else ""
-        
         # Format the values for display
-        if all(isinstance(v, str) for v in display_values):
+        if all(isinstance(v, str) for v in values):
             # Text values get quotes
-            formatted_values = [f'"{v}"' for v in display_values]
+            formatted_values = [f'"{v}"' for v in values]
         else:
             # Non-text values don't need quotes
-            formatted_values = [str(v) for v in display_values]
+            formatted_values = [str(v) for v in values]
             
-        values_str = ", ".join(formatted_values) + more_indicator
+        values_str = ", ".join(formatted_values)
         md_sections.append(f"\n### {col_name}")
         md_sections.append(f"- Values: {values_str}")
         md_sections.append(f"- Total unique values: {len(values)}")
@@ -511,7 +563,7 @@ def create_minimal_context_index(error_msg):
     ## Warning
     Could not connect to database to extract actual schema: {error_msg}
 
-    ## Table: structured_rag
+    ## Table: acwa_finance
     - Contains financial data including entities, accounts, and balances
 
     ## Important Financial Concepts
@@ -529,8 +581,8 @@ def display_progress_steps(process_state):
     steps = [
         {"icon": "⚙️", "title": "Analyzing Query", "description": "Understanding your financial question"},
         {"icon": "📈", "title": "Creating Reasoning", "description": "Planning the approach to solve this question"},
-        {"icon": "📝", "title": "Crafting SQL", "description": "Building a database query based on reasoning"},
-        {"icon": "🔍", "title": "Executing Query", "description": "Retrieving data from financial database"},
+        {"icon": "📝", "title": "Collecting Data", "description": "Collecting data based on reasoning"},
+        {"icon": "🔍", "title": "Executing the logic", "description": "Processing retrived data from financial database"},
         {"icon": "✨", "title": "Creating Insights", "description": "Analyzing results for meaningful insights"}
     ]
     
@@ -571,7 +623,7 @@ def display_progress_steps(process_state):
 
 def generate_reasoning(user_query, db_schema, db_context_index):
     """
-    Uses Claude to generate a reasoning plan based on the user query and schema.
+    Uses the selected LLM to generate a reasoning plan based on the user query and schema.
     """
     prompt = REASONING_AGENT_PROMPT.format(
         user_query=user_query,
@@ -579,7 +631,7 @@ def generate_reasoning(user_query, db_schema, db_context_index):
         db_context_index=db_context_index
     )
     
-    # Call Claude to generate a reasoning plan
+    # Call LLM to generate a reasoning plan
     response = call_llm(prompt=prompt)
     
     # Extract the reasoning plan
@@ -594,7 +646,7 @@ def generate_reasoning(user_query, db_schema, db_context_index):
 
 def generate_sql_from_reasoning(user_query, db_schema, reasoning_plan, error_context=""):
     """
-    Uses Claude to generate SQL based on the reasoning plan.
+    Uses the selected LLM to generate SQL based on the reasoning plan.
     """
     prompt = SQL_GENERATION_PROMPT.format(
         user_query=user_query,
@@ -603,7 +655,7 @@ def generate_sql_from_reasoning(user_query, db_schema, reasoning_plan, error_con
         error_context=error_context
     )
     
-    # Call Claude to generate SQL
+    # Call LLM to generate SQL
     response = call_llm(prompt=prompt)
     
     # Extract the SQL
@@ -627,14 +679,14 @@ def clean_sql_response(response_text):
         if match:
             return response_text[match.start():].strip().rstrip(";")
     return response_text
- 
+
 def execute_sql_query(sql_query):
     """
     Executes a SQL query and returns the results
     """
     try:
         # Connect to PostgreSQL database
-        conn = psycopg2.connect(DB_URL, sslmode='require', options="-c AddressFamily=ipv4")
+        conn = psycopg2.connect(DB_URL, sslmode='require')
  
         with conn:
             with conn.cursor() as cur:
@@ -653,10 +705,10 @@ def execute_sql_query(sql_query):
  
     except Exception as e:
         return None, str(e)
- 
+
 def generate_insights(user_query, sql_query, data):
     """
-    Generate natural language insights from SQL results
+    Generate natural language insights from SQL results using the selected LLM
     """
     if data is None or len(data) == 0:
         return "I didn't find any data that matches your query. Could you try asking in a different way?"
@@ -677,13 +729,13 @@ def generate_insights(user_query, sql_query, data):
         data_sample=data_sample
     )
    
-    # Call Claude to generate insights
+    # Call LLM to generate insights
     response = call_llm(prompt=prompt)
    
     insights = response.choices[0].message.content
    
     return insights
- 
+
 def create_chat_message(role, content, dataframe=None, reasoning=None):
     """
     Create a chat message with either user or assistant styling using native Streamlit components
@@ -718,7 +770,118 @@ def create_chat_message(role, content, dataframe=None, reasoning=None):
             if dataframe is not None and not dataframe.empty:
                 with st.expander("View Data Table", expanded=False):
                     st.dataframe(dataframe, use_container_width=True)
- 
+
+def display_model_info():
+    """
+    Display current model and token usage information
+    """
+    reasoning_models = ["o4-mini", "o3-mini"]
+    
+    # Create a container for the model info
+    with st.expander("Model Information", expanded=False):
+        st.markdown(f'<div class="model-info-box">Currently using: <b>{st.session_state.model}</b></div>', unsafe_allow_html=True)
+        
+        if st.session_state.model in reasoning_models:
+            st.markdown(f'<div class="model-info-box">Reasoning Intensity: <b>{st.session_state.reasoning_effort}</b></div>', unsafe_allow_html=True)
+            st.info("""
+            **About Reasoning Models:**
+            Reasoning models like o4-mini and o3-mini "think before they answer," producing a long internal chain of thought.
+            - **Low intensity:** Favors speed and economical token usage
+            - **Medium intensity:** Balanced approach (recommended)
+            - **High intensity:** Favors more complete reasoning for complex problems
+            
+            Note: Reasoning tokens are billed as output tokens even though they're not visible in the response.
+            """)
+        
+        # Add a note about token usage
+        if 'token_usage' in st.session_state and st.session_state.token_usage:
+            st.write("**Token Usage (Last Query):**")
+            st.write(f"- Input Tokens: {st.session_state.token_usage.get('input_tokens', 'N/A')}")
+            st.write(f"- Output Tokens: {st.session_state.token_usage.get('output_tokens', 'N/A')}")
+            
+            if st.session_state.model in reasoning_models and 'reasoning_tokens' in st.session_state.token_usage:
+                st.write(f"- Reasoning Tokens: {st.session_state.token_usage.get('reasoning_tokens', 'N/A')}")
+            
+            st.write(f"- Total Tokens: {st.session_state.token_usage.get('total_tokens', 'N/A')}")
+
+def show_settings_page():
+    """
+    Display settings page for LLM model selection and configuration
+    """
+    st.title("Settings")
+    
+    # Model selection
+    st.subheader("Model Selection")
+    
+    model_options = {
+        "Standard Models": ["gpt-4.1", "gpt-4o"],
+        "Reasoning Models": ["o4-mini", "o3-mini"]
+    }
+    
+    model_category = st.radio(
+        "Model Category", 
+        options=list(model_options.keys()),
+        index=0 if st.session_state.model in model_options["Standard Models"] else 1
+    )
+    
+    selected_model = st.selectbox(
+        "Select Model",
+        options=model_options[model_category],
+        index=model_options[model_category].index(st.session_state.model) if st.session_state.model in model_options[model_category] else 0
+    )
+    
+    # Only show reasoning settings for reasoning models
+    if model_category == "Reasoning Models":
+        st.subheader("Reasoning Settings")
+        
+        reasoning_effort = st.select_slider(
+            "Reasoning Intensity",
+            options=["low", "medium", "high"],
+            value=st.session_state.reasoning_effort,
+            help="Controls how much thinking the model does before answering. Higher settings provide more thorough analysis but use more tokens."
+        )
+        
+        # Explanation of reasoning intensity
+        st.info("""
+        **Reasoning Intensity Settings:**
+        - **Low**: Faster responses, uses fewer tokens, but may miss details in complex problems
+        - **Medium**: Balanced approach suitable for most questions
+        - **High**: More thorough analysis for complex questions, uses more tokens
+        """)
+    else:
+        reasoning_effort = "medium"  # Default value for non-reasoning models
+    
+    # Apply button
+    if st.button("Apply Settings", type="primary"):
+        st.session_state.model = selected_model
+        st.session_state.reasoning_effort = reasoning_effort
+        st.success(f"Settings updated! Now using {selected_model} model.")
+        st.rerun()
+    
+    # Model information
+    if model_category == "Reasoning Models":
+        st.subheader("About Reasoning Models")
+        st.markdown("""
+        **Reasoning models** like o4-mini and o3-mini are designed to "think before they answer," producing a long internal chain of thought before responding to the user. 
+        
+        **Key benefits:**
+        - Better at complex problem-solving
+        - More systematic approaches to multi-step tasks
+        - Enhanced analytical capabilities for financial data analysis
+        
+        **How it works:**
+        Reasoning models use "reasoning tokens" to work through the problem step by step (though these steps aren't visible). These tokens count toward your usage but provide deeper analysis.
+        """)
+    
+    # Reset button
+    st.subheader("Reset Conversation")
+    if st.button("Reset Conversation History", type="secondary"):
+        st.session_state.messages = []
+        st.session_state.processing = False
+        st.session_state.process_state = 0
+        st.success("Conversation history has been reset!")
+        st.rerun()
+
 def process_user_query(user_query):
     """
     Process a user query with visual feedback on each step
@@ -811,7 +974,7 @@ def process_user_query(user_query):
         st.session_state.processing = False
         st.session_state.process_state = 0
         progress_placeholder.empty()
- 
+
 def financial_data_pipeline(user_query, max_attempts=3):
     """
     Main function that orchestrates the entire pipeline with retry logic and reasoning step
@@ -848,7 +1011,7 @@ def financial_data_pipeline(user_query, max_attempts=3):
     2. Verify column names match exactly what's in the schema (case-sensitive)
     3. Make sure your SQL is valid for PostgreSQL
     4. Check for any unnecessary semicolons or special characters
-    5. Ensure the query is focused on the structured_rag table
+    5. Ensure the query is focused on the acwa_finance table
     6. Make sure all calculations and data processing are done directly in SQL
     7. Remember to handle NULL or empty string values with NULLIF() and appropriate CAST functions
      
@@ -879,7 +1042,7 @@ def financial_data_pipeline(user_query, max_attempts=3):
         }
     finally:
         progress_container.empty()
- 
+
 def create_improved_chat_ui():
     """
     Create an improved chat UI
@@ -900,51 +1063,54 @@ def create_improved_chat_ui():
     # If processing, show the enhanced progress indicator
     if st.session_state.processing:
         display_progress_steps(st.session_state.process_state)
- 
+
 def main():
     """
-    Main function that sets up the application UI
+    Main function that sets up the application UI with settings and chat pages
     """
-    # App header
-    st.title("Financial Insights Assistant 💰")
+    # Set up sidebar navigation
+    st.sidebar.title("Financial Insights Assistant")
+    page = st.sidebar.radio("Navigation", ["Chat", "Settings"])
     
-    # Brief description
-    st.info("""
-    Ask questions about your financial data in plain English. 
-    I'll analyze the data and provide insights with detailed reasoning.
-    """)
+    # Display model info in sidebar
+    with st.sidebar:
+        display_model_info()
     
-    # Add example questions
-    with st.expander("Example questions you can ask"):
-        st.markdown("""
-        - What is the change in expenses for Entity 10101 in Jan-25?
-        - What's the total for long-term intercompany receivables of 10202 in Jan-25?
-        - Extract all long-term intercompany receivables grouped by entity
-        - Show me the top 5 entities by expenses in Jan-25
-        - Calculate the profit for each business line in Jan-25
+    # Display the selected page
+    if page == "Chat":
+        # App header
+        st.title("Financial Insights Assistant 💰")
+        
+        # Brief description
+        st.info("""
+        Ask questions about your financial data in plain English. 
+        I'll analyze the data and provide insights with detailed reasoning.
         """)
+        
+        # Add example questions
+        with st.expander("Example questions you can ask"):
+            st.markdown("""
+            - What is the change in expenses for Entity 10101 in Jan-25?
+            - What's the total for long-term intercompany receivables of 10202 in Jan-25?
+            - Extract all long-term intercompany receivables grouped by entity
+            - Show me the top 5 entities by expenses in Jan-25
+            - Calculate the profit for each business line in Jan-25
+            """)
+        
+        # Display chat interface
+        create_improved_chat_ui()
+       
+        # Input for user question
+        user_query = st.chat_input("Ask about your financial data...")
+       
+        if user_query:
+            # Process the query
+            process_user_query(user_query)
+            st.rerun()
     
-    # Display chat interface
-    create_improved_chat_ui()
-   
-    # Input for user question
-    user_query = st.chat_input("Ask about your financial data...")
-   
-    if user_query:
-        # Process the query
-        process_user_query(user_query)
-        st.rerun()
-   
-    # Reset button (only show if there are messages)
-    if st.session_state.messages:
-        reset_col1, reset_col2, reset_col3 = st.columns([1, 1, 2])
-        with reset_col1:
-            if st.button("Start New Conversation", type="secondary"):
-                st.session_state.messages = []
-                st.session_state.processing = False
-                st.session_state.process_state = 0
-                st.rerun()
- 
+    elif page == "Settings":
+        show_settings_page()
+
 # Run the app
 if __name__ == "__main__":
     main()
