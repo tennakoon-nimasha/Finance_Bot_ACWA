@@ -7,10 +7,15 @@ import re
 import psycopg2
 from urllib.parse import urlparse
 import time
+
+# from langsmith.wrappers import wrap_openai
+# from langsmith import traceable
  
 # Load environment variables
 from dotenv import load_dotenv
 load_dotenv()
+
+
  
 # Set page config
 st.set_page_config(
@@ -62,9 +67,9 @@ header {visibility: hidden;}
 """, unsafe_allow_html=True)
  
 # Configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPASBASE_CONNECTION_STRING = os.getenv("SUPASBASE_CONNECTION_STRING")
-DB_URL = SUPASBASE_CONNECTION_STRING
+DB_URL = "postgresql://postgres.unqxbmnirztfjlkxnrqp:.vb9EKz9jr_8p$h@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
  
 # Initialize session state for chat history
 if 'messages' not in st.session_state:
@@ -74,15 +79,38 @@ if 'processing' not in st.session_state:
 if 'process_state' not in st.session_state:
     st.session_state.process_state = 0
  
-# Initialize OpenAI client
-@st.cache_resource
-def get_openai_client():
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-    )
- 
-client = get_openai_client()
+# client = wrap_openai(openai.Client())
+client =OpenAI()
+# @traceable
+def call_llm(prompt, reason_model=False):
+    # Initialize OpenAI client
+    
+    if reason_model == True:
+        response = client.responses.create(
+            model="o4-mini",
+            reasoning={"effort": "medium"},
+            input=[
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ]
+        )
+
+        return response
+    else:
+        response = client.chat.completions.create(
+            # model="anthropic/claude-3.7-sonnet:thinking",
+            model="gpt-4o",
+            # max_tokens=1000,
+            temperature=0,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        return response
+
  
 # Agent prompts
 REASONING_AGENT_PROMPT = """
@@ -243,49 +271,256 @@ def get_db_schema():
     "Total Credit_1" (text)
     "Closing Balance_1" (text)"""
  
-def create_database_context_index():
+def create_database_context_index(refresh_cache=False):
     """
-    Creates a comprehensive context index of the database with specific information for our financial data.
+    Creates a comprehensive context index of the database with real data.
+    Extracts column names, data types, and unique values for categorical columns.
+    Uses caching to avoid repeated expensive queries.
+    
+    Args:
+        refresh_cache: Force refresh the cache even if it exists
+        
+    Returns:
+        A markdown-formatted string with database context information
     """
-    context_sections = ["# Database Context Index"]
-   
-    # Add table information
-    context_sections.append("\n## Table: structured_rag")
-   
-    # Add specific information about field interpretations
-    context_sections.append("\n## Important Field Interpretations")
-    context_sections.append("- \"Entity\" refers to entity name")
-    context_sections.append("- In \"Account Grouping\":")
-    context_sections.append("  - Income categories: \"Other income\", \"Revenue - Services\"")
-    context_sections.append("  - Expense categories: \"Dividend paid\", \"Other Overheads - Consultancy\", \"Other Overheads - G&A costs\", \"Other Overheads - Staff\"")
-    context_sections.append("- Profile calculation: Income - Expenses")
-   
-    # Add column analysis based on our schema
-    context_sections.append("\n### Column Analysis:")
-   
-    # Add some key columns with sample values
-    key_columns = [
-        ("Entity Name", "TEXT", ["Company A", "Company B", "Company C"]),
-        ("Business Line Name", "TEXT", ["Division 1", "Division 2", "Division 3"]),
-        ("Account Grouping", "TEXT", ["Revenue - Services", "Other income", "Other Overheads - Staff", "Other Overheads - G&A costs"]),
-        ("Region", "TEXT", ["North America", "Europe", "Asia Pacific"]),
-        ("Currency", "TEXT", ["USD", "EUR", "GBP"]),
-        ("Closing Balance", "TEXT", ["10000", "25000", "-5000"])
-    ]
-   
-    for col_name, data_type, samples in key_columns:
-        context_sections.append(f"\n#### {col_name} ({data_type}):")
-        context_sections.append(f"- Sample values: {', '.join(samples)}")
-   
-    # Add common calculation patterns for financial analysis
-    context_sections.append("\n## Recommended Calculation Patterns")
-    context_sections.append("- For financial aggregations: Use SUM, AVG, MIN, MAX on monetary columns")
-    context_sections.append("- For grouping: Use GROUP BY with categories like 'Entity Name', 'Business Line Name', or 'Account Grouping'")
-    context_sections.append("- For profit calculations: Sum income categories minus sum of expense categories")
-    context_sections.append("- For time analysis: Filter by 'Month' or 'Period Name'")
-    context_sections.append("- For regional analysis: Group by 'Region' or 'Region Description'")
-   
-    return "\n".join(context_sections)
+    # Check cache first if not forcing refresh
+    cache_file = "db_context_cache.json"
+    if not refresh_cache and os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+                # Verify cache has the expected structure
+                if all(key in cached_data for key in ["timestamp", "context_markdown"]):
+                    # Check if cache is recent (less than 24 hours old)
+                    cache_age = time.time() - cached_data["timestamp"]
+                    if cache_age < 86400:  # 24 hours in seconds
+                        return cached_data["context_markdown"]
+        except (json.JSONDecodeError, KeyError):
+            # Cache is invalid, continue to rebuild it
+            pass
+    
+    # Connect to the database
+    try:
+        conn = psycopg2.connect(DB_URL, sslmode='require',options="-c AddressFamily=ipv4")
+    except Exception as e:
+        # Fallback to minimal context if DB connection fails
+        return create_minimal_context_index(str(e))
+    
+    try:
+        # Dictionary to store all the context data
+        context_data = {
+            "table_name": "structured_rag",
+            "columns": {},
+            "categorical_values": {},
+            "numeric_stats": {},
+            "financial_interpretations": {}
+        }
+        
+        with conn.cursor() as cur:
+            # 1. Get all column information
+            cur.execute("""
+                SELECT column_name, data_type, is_nullable 
+                FROM information_schema.columns 
+                WHERE table_name = 'structured_rag'
+                ORDER BY ordinal_position
+            """)
+            columns_info = cur.fetchall()
+            
+            # Store column info
+            for col_name, data_type, is_nullable in columns_info:
+                context_data["columns"][col_name] = {
+                    "data_type": data_type,
+                    "nullable": is_nullable
+                }
+            
+            # 2. Identify likely categorical columns
+            categorical_columns = []
+            numeric_columns = []
+            
+            for col_name, data_type, _ in columns_info:
+                # Skip columns that are clearly not categorical
+                if data_type.startswith('int') or data_type.startswith('float') or data_type.startswith('numeric'):
+                    numeric_columns.append(col_name)
+                    continue
+                    
+                # Check cardinality for text columns
+                cur.execute(f"""
+                    SELECT COUNT(DISTINCT "{col_name}") 
+                    FROM structured_rag 
+                    WHERE "{col_name}" IS NOT NULL
+                """)
+                distinct_count = cur.fetchone()[0]
+                
+                # Check if column has row count info
+                cur.execute(f"""
+                    SELECT COUNT(*) 
+                    FROM structured_rag
+                """)
+                total_count = cur.fetchone()[0]
+                
+                # Categorical if distinct values are less than 5% of total rows or less than 100
+                if distinct_count < min(total_count * 0.05, 100):
+                    categorical_columns.append(col_name)
+            
+            # 3. Get unique values for categorical columns
+            for col_name in categorical_columns:
+                cur.execute(f"""
+                    SELECT DISTINCT "{col_name}" 
+                    FROM structured_rag 
+                    WHERE "{col_name}" IS NOT NULL 
+                    ORDER BY "{col_name}"
+                    LIMIT 50  -- Limit to prevent huge result sets
+                """)
+                values = [row[0] for row in cur.fetchall()]
+                
+                if values:  # Only add if we have values
+                    context_data["categorical_values"][col_name] = values
+            
+            # 4. Get statistics for numeric/financial columns
+            # Closing Balance might be stored as text but contains numeric data
+            for col_name in ["Closing Balance", "Opening Balance", "Total Debit", "Total Credit"]:
+                if col_name in context_data["columns"]:
+                    try:
+                        cur.execute(f"""
+                            SELECT 
+                                MIN(CAST("{col_name}" AS NUMERIC)), 
+                                MAX(CAST("{col_name}" AS NUMERIC)),
+                                AVG(CAST("{col_name}" AS NUMERIC)),
+                                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST("{col_name}" AS NUMERIC))
+                            FROM structured_rag
+                            WHERE "{col_name}" ~ '^-?[0-9]*\\.?[0-9]+$'
+                        """)
+                        min_val, max_val, avg_val, median = cur.fetchone()
+                        
+                        if min_val is not None:  # Only store if we got results
+                            context_data["numeric_stats"][col_name] = {
+                                "min": float(min_val) if min_val is not None else None,
+                                "max": float(max_val) if max_val is not None else None,
+                                "avg": float(avg_val) if avg_val is not None else None,
+                                "median": float(median) if median is not None else None
+                            }
+                    except Exception:
+                        # Skip if we have issues with this column
+                        pass
+        
+        # 5. Add domain-specific financial interpretations
+        context_data["financial_interpretations"] = {
+            "income_categories": ["Other income", "Revenue - Services"],
+            "expense_categories": ["Dividend paid", "Other Overheads - Consultancy", 
+                                  "Other Overheads - G&A costs", "Other Overheads - Staff"],
+            "profit_calculation": "Sum of income categories minus sum of expense categories",
+            "long_term_intercompany_receivables": {
+                "account_grouping": "Non current assets",
+                "account_name_pattern": "Long term Inter company receivable"
+            }
+        }
+        
+        # 6. Format as markdown for AI prompt
+        context_markdown = format_context_as_markdown(context_data)
+        
+        # 7. Cache the results
+        with open(cache_file, 'w') as f:
+            json.dump({
+                "timestamp": time.time(),
+                "context_data": context_data,
+                "context_markdown": context_markdown
+            }, f)
+        
+        return context_markdown
+        
+    except Exception as e:
+        # Log the error
+        print(f"Error building database context: {str(e)}")
+        # Return minimal context if anything fails
+        return create_minimal_context_index(str(e))
+    finally:
+        # Always close the connection
+        conn.close()
+
+def format_context_as_markdown(context_data):
+    """
+    Formats the context data dictionary as a markdown string for AI prompt.
+    """
+    md_sections = ["# Database Context Index"]
+    
+    # Table info
+    md_sections.append(f"\n## Table: {context_data['table_name']}")
+    
+    # Column info
+    md_sections.append("\n## Schema Information")
+    for col_name, info in context_data["columns"].items():
+        md_sections.append(f"- \"{col_name}\" ({info['data_type']})")
+    
+    # Categorical values
+    md_sections.append("\n## Categorical Column Values")
+    for col_name, values in context_data["categorical_values"].items():
+        # Limit number of values displayed to keep prompt concise
+        display_values = values[:20]  # Show only first 20
+        more_indicator = "..." if len(values) > 20 else ""
+        
+        # Format the values for display
+        if all(isinstance(v, str) for v in display_values):
+            # Text values get quotes
+            formatted_values = [f'"{v}"' for v in display_values]
+        else:
+            # Non-text values don't need quotes
+            formatted_values = [str(v) for v in display_values]
+            
+        values_str = ", ".join(formatted_values) + more_indicator
+        md_sections.append(f"\n### {col_name}")
+        md_sections.append(f"- Values: {values_str}")
+        md_sections.append(f"- Total unique values: {len(values)}")
+    
+    # Numeric stats
+    if context_data["numeric_stats"]:
+        md_sections.append("\n## Numeric Column Statistics")
+        for col_name, stats in context_data["numeric_stats"].items():
+            md_sections.append(f"\n### {col_name}")
+            for stat_name, value in stats.items():
+                if value is not None:
+                    md_sections.append(f"- {stat_name.capitalize()}: {value}")
+    
+    # Financial interpretations
+    md_sections.append("\n## Financial Domain Information")
+    
+    income_categories = context_data["financial_interpretations"]["income_categories"]
+    md_sections.append("\n### Income Categories")
+    md_sections.append("- " + "\n- ".join(income_categories))
+    
+    expense_categories = context_data["financial_interpretations"]["expense_categories"]
+    md_sections.append("\n### Expense Categories")
+    md_sections.append("- " + "\n- ".join(expense_categories))
+    
+    md_sections.append("\n### Key Calculations")
+    md_sections.append(f"- Profit: {context_data['financial_interpretations']['profit_calculation']}")
+    
+    md_sections.append("\n### Long-term Intercompany Receivables")
+    ltir = context_data["financial_interpretations"]["long_term_intercompany_receivables"]
+    md_sections.append(f"- Account Grouping: \"{ltir['account_grouping']}\"")
+    md_sections.append(f"- Account Name includes: \"{ltir['account_name_pattern']}\"")
+    
+    # Return the combined markdown
+    return "\n".join(md_sections)
+
+def create_minimal_context_index(error_msg):
+    """
+    Creates a minimal context index when database connection fails.
+    """
+    return f"""# Database Context Index (Minimal Fallback)
+
+    ## Warning
+    Could not connect to database to extract actual schema: {error_msg}
+
+    ## Table: structured_rag
+    - Contains financial data including entities, accounts, and balances
+
+    ## Important Financial Concepts
+    - Income includes "Other income" and "Revenue - Services"
+    - Expenses include "Dividend paid", "Other Overheads - Consultancy", "Other Overheads - G&A costs", "Other Overheads - Staff"
+    - Profit calculation: Income - Expenses
+    - Period Name format: "Jan-25"
+    - Long-term intercompany receivables are in "Non current assets" with account names containing "Long term Inter company receivable"
+    """
 
 def display_progress_steps(process_state):
     """
@@ -345,14 +580,7 @@ def generate_reasoning(user_query, db_schema, db_context_index):
     )
     
     # Call Claude to generate a reasoning plan
-    response = client.chat.completions.create(
-        model="anthropic/claude-3.7-sonnet:thinking",
-        max_tokens=1000,
-        temperature=0,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
+    response = call_llm(prompt=prompt)
     
     # Extract the reasoning plan
     reasoning_plan = response.choices[0].message.content
@@ -376,14 +604,7 @@ def generate_sql_from_reasoning(user_query, db_schema, reasoning_plan, error_con
     )
     
     # Call Claude to generate SQL
-    response = client.chat.completions.create(
-        model="anthropic/claude-3.7-sonnet:thinking",
-        max_tokens=1000,
-        temperature=0,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
+    response = call_llm(prompt=prompt)
     
     # Extract the SQL
     sql_query = response.choices[0].message.content
@@ -411,39 +632,27 @@ def execute_sql_query(sql_query):
     """
     Executes a SQL query and returns the results
     """
-    conn = None
     try:
-        # Connect to PostgreSQL database with additional parameters to fix IPv6 issues
-        conn = psycopg2.connect(
-            DB_URL, 
-            sslmode='require',
-            options="-c AddressFamily=ipv4",  # Force IPv4 connections
-            connect_timeout=10  # Add a connection timeout
-        )
+        # Connect to PostgreSQL database
+        conn = psycopg2.connect(DB_URL, sslmode='require', options="-c AddressFamily=ipv4")
  
-        with conn.cursor() as cur:
-            cur.execute(sql_query)
-            results = cur.fetchall()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_query)
+                results = cur.fetchall()
                
-            # Get column names
-            column_names = [desc[0] for desc in cur.description]
+                # Get column names
+                column_names = [desc[0] for desc in cur.description]
                
-            # Create a list of dictionaries for the dataframe
-            rows = []
-            for row in results:
-                rows.append(dict(zip(column_names, row)))
+                # Create a list of dictionaries for the dataframe
+                rows = []
+                for row in results:
+                    rows.append(dict(zip(column_names, row)))
                
-            return rows, None
+                return rows, None
  
     except Exception as e:
         return None, str(e)
-    finally:
-        # Ensure connection is always closed properly
-        if conn is not None:
-            try:
-                conn.close()
-            except:
-                pass
  
 def generate_insights(user_query, sql_query, data):
     """
@@ -469,14 +678,7 @@ def generate_insights(user_query, sql_query, data):
     )
    
     # Call Claude to generate insights
-    response = client.chat.completions.create(
-        model="anthropic/claude-3.7-sonnet",
-        max_tokens=1000,
-        temperature=0.2,
-        messages=[
-            {"role": "user", "content": prompt}
-        ]
-    )
+    response = call_llm(prompt=prompt)
    
     insights = response.choices[0].message.content
    
@@ -547,7 +749,7 @@ def process_user_query(user_query):
         reasoning_plan, reasoning_thinking = generate_reasoning(user_query, db_schema, db_context_index)
         
         # Display reasoning plan
-        with st.expander("View Reasoning Plan", expanded=False):
+        with st.expander("View Reasoning Plan", expanded=True):
             st.markdown(f'<div class="reasoning-box">{reasoning_plan}</div>', unsafe_allow_html=True)
         
         # Step 3: Generate SQL from Reasoning
