@@ -103,7 +103,7 @@ def call_llm(prompt):
     reasoning_effort = st.session_state.reasoning_effort
     
     # Determine if this is a reasoning model
-    reasoning_models = ["o4-mini", "o3-mini"]
+    reasoning_models = ["o3", "o4-mini", "o3-mini"]
     is_reasoning_model = model in reasoning_models
     
     if is_reasoning_model:
@@ -775,7 +775,7 @@ def display_model_info():
     """
     Display current model and token usage information
     """
-    reasoning_models = ["o4-mini", "o3-mini"]
+    reasoning_models = ["o3", "o4-mini", "o3-mini"]
     
     # Create a container for the model info
     with st.expander("Model Information", expanded=False):
@@ -815,7 +815,7 @@ def show_settings_page():
     
     model_options = {
         "Standard Models": ["gpt-4.1", "gpt-4o"],
-        "Reasoning Models": ["o4-mini", "o3-mini"]
+        "Reasoning Models": ["o3", "o4-mini", "o3-mini"]
     }
     
     model_category = st.radio(
