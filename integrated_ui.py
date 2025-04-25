@@ -2,6 +2,7 @@ import os
 import json
 import pandas as pd
 import streamlit as st
+# import openai
 from openai import OpenAI
 import re
 import psycopg2
@@ -75,7 +76,7 @@ header {visibility: hidden;}
 # Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPASBASE_CONNECTION_STRING = os.getenv("SUPASBASE_CONNECTION_STRING")
-DB_URL = SUPASBASE_CONNECTION_STRING
+DB_URL = "postgresql://postgres.unqxbmnirztfjlkxnrqp:.vb9EKz9jr_8p$h@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
 
 # Initialize session state for chat history and settings
 if 'messages' not in st.session_state:
@@ -85,9 +86,9 @@ if 'processing' not in st.session_state:
 if 'process_state' not in st.session_state:
     st.session_state.process_state = 0
 if 'model' not in st.session_state:
-    st.session_state.model = "gpt-4.1"
+    st.session_state.model = "o3"
 if 'reasoning_effort' not in st.session_state:
-    st.session_state.reasoning_effort = "medium"
+    st.session_state.reasoning_effort = "high"
 if 'token_usage' not in st.session_state:
     st.session_state.token_usage = {}
 
@@ -211,7 +212,7 @@ You are a specialized financial data analyst. Your task is to:
 ### Account column value and Account Grouping value for the Financial Category:
 - Revenue: Account in range 40000
 - Direct cost: Account in range 50000
-- G&A expenses: (Account in range 60000) and Account Grouping is "Other Overheads - G&A costs"
+- G&A expenses: (Account in range 60000 to 69999) then Exclude follwing accounts from Account Grouping : "Other Overheads - tax and zakat", "Other Overheads - Finance costs", "Other Overheads - Staff"
 - Finance costs: Account in range 60000 and Account Grouping is "Other Overheads - Finance costs"
 - Tax: Account in range 60000 and Account Grouping is "Other Overheads - Tax and zakat"
 - Staff costs: Account in range 60000 and Account Grouping is "Other Overheads - Staff"
@@ -241,45 +242,70 @@ You are a specialized financial data analyst. Your task is to:
 #Here are some most frequent queries and the logic behind them to answer:
  
 Q: Can you tell me the total balance for the long-term intercompany receivables of <<entity>> as of <<date>> ?
-Logic : The entity is identified by the "Entity" column in the database.
-- The date is specified in the "Month" column in the format "Jan-25".
-- Filter the codes by the "Intercompany" column to exclude "00000".
+Logic : - Filter the "Entity" column by <<entity>>.
+- Filter the "Month" column by <<date>> (format: "Jan-25").
+- Filter the "Intercompany" column to exclude "00000".
 - Filter the "Account" column to include only "11611".
-- The balance is the sum of "Closing Balance" column for the filtered rows.
+- The balance is the sum of the "Closing Balance" column for the filtered rows.
  
 Q: What is the change in <<expenses>> for <<month>> of <<entity>>?
-Logic :The date is specified in the "Month" column in the format "Jan-25".
--Filter the "Account" column to include values in the range of 50000 and 70000.
--Filter the "Entity" column to include only the specified entity.
--Filter the "Month" column to include only the specified month.
--Calculate the change in expenses by subtracting the previous month's total from the current month's total.
+Logic :- Filter the "Entity" column by <<entity>>.
+- Filter the "Account" column for values in the range 50000 to 69999 (inclusive).
+- Filter the "Month" column to include:
+  - The current month: <<month>> (e.g., "Feb-25")
+  - The previous month (e.g., "Jan-25" for "Feb-25").
+- Calculate the total "Closing Balance" for each month.
+- Change in expenses = Current month total - Previous month total.
  
 Q: Can you confirm whether we have any dividend payables or distributions pending for related parties under <<entity>> as of <<date>>?
-Logic : The date is specified in the "Month" column in the format "Jan-25".
-- Filter the "Account" column to include values equal to 22111.
-- Filter the "Entity" column to include only the specified entity.
+Logic : - Filter the "Entity" column by <<entity>>.
+- Filter the "Month" column by <<date>>.
+- Filter the "Account" column to include only 22211.
 - The answer is the sum of the "Closing Balance" column for the filtered rows.
  
 Q: Can you update me on the<<income/expense/asset/liability>> for the <<period>> of <<entity>>?
-Logic : The date is specified in the "Month" column in the format "Jan-25".
-- Filter the "Account" column to include values in the range of 40000-49999 for income, 50000-69999 for expenses, 10000-19999 for assets, and 20000-29999 for liabilities.
-- Filter the "Entity" column to include only the specified entity.
-- Then answer is the sum of the "Closing Balance" column for the filtered rows.
+Logic : - Filter the "Entity" column by <<entity>>.
+- Filter the "Month" column by <<period>> (format: "Jan-25").
+- Filter the "Account" column depending on the requested type:
+  - Income: 40000-49999
+  - Expense: 50000-69999
+  - Asset: 10000-19999
+  - Liability: 20000-29999
+- The answer is the sum of the "Closing Balance" column for the filtered rows..
  
 Q: What is the profit, revenue, staff cost and G&A expenses for <<year>>, <<entity>>?
-Logic : The date is specified in the "Month" column in the format "Jan-25".
-- For the staff cost, filter the "Account" column to include values in the range of 60000 and "Account Grouping" is "Other Overheads - Staff". The answer is the sum of the "Closing Balance" column for the filtered rows.
-- For the G&A expenses, filter the "Account" column to include values in the range of 60000 and "Account Grouping" is "Other Overheads - G&A costs". The answer is the sum of the "Closing Balance" column for the filtered rows.
-- For the revenue, filter the "Account" column to include values in the range of 40000. The answer is the sum of the "Closing Balance" column for the filtered rows.
-- For total cost, filter the "Account" column to include values in the range of 50000 and 60000. The answer is the sum of the "Closing Balance" column for the filtered rows.
-- For the profit, use the expression: Profit = Revenue + (Total cost).
-- Note that the incomes are negative values in the database and the expenses are positive values.
+Logic : - Filter the "Entity" column by <<entity>>.
+- Filter the "Month" column to include all months ending in -<<year>> (e.g., "Jan-25" to "Dec-25").
+- Staff Cost:
+  - "Account" in 60000-69999
+  - "Account Grouping" = "Other Overheads - Staff"
+  - Sum the "Closing Balance" column
+- G&A Expenses:
+  - "Account" in 60000-69999
+  - Exclude follwings : "Other Overheads - tax and zakat", "Other Overheads - Finance costs", "Other Overheads - Staff"
+  - Sum the "Closing Balance" column
+- Revenue:
+  - "Account" in 40000-49999
+  - Sum the "Closing Balance" (note: revenue is negative)
+- Total Cost:
+  - "Account" in 50000-69999
+  - Sum the "Closing Balance" (positive values)
+
+- Profit = Summation of accounts starting from range 40000 to 69999.
  
 Q: Give comparison of profit, revenue, staff cost and G&A expenses for  to  <<entity>> for <<year1>>, <<year2>>
-Logic : Follow the same filtering and calculation rules as the question "What is the profit, revenue, staff cost and G&A expenses for <<year>>, <<entity>>?".
-- As the values are cumulative, you will need to filter the values for the month of 'December' for both years.
-- Since this is a comparison, you will need to filter the data for both years and calculate the values separately.
-- Then, the final answers will be the difference between the values in the two years.
+Logic : - Filter the "Entity" column by <<entity>>.
+- Filter the "Month" column to only include:
+  - "Dec-<<last two digits of year1>>" (e.g., "Dec-24")
+  - "Dec-<<last two digits of year2>>" (e.g., "Dec-25")
+- Use the same filtering rules as the previous question for:
+  - Staff Cost
+  - G&A Expenses
+  - Revenue
+  - Total Cost
+  - Profit = Revenue + Total Cost
+- For each metric, calculate the difference:
+  - Difference = Value in <<year2>> - Value in <<year1>>.
  
 ## Output Format:
 Provide a numbered list of reasoning steps explaining the approach to take.
@@ -300,24 +326,12 @@ You are a specialized SQL query generation assistant for financial data. Your ta
 
 ## Guidelines:
 - We are working with a single PostgreSQL table named 'acwa_finance'
-- Use advanced SQL operations (GROUP BY, CASE WHEN, etc.) as outlined in the reasoning plan
+- Follow the guidelines outlined in the reasoning plan
 - ALL data processing must be done within the SQL query itself - do not rely on any post-processing
 - Format and structure your query results to directly answer the question
-- Double-check all column references against the schema
+- IMPORTANT : Double-check all column references against the schema they are Case Sensitive
 - Use CTEs (WITH clauses) for complex multi-stage processing
 - Use PostgreSQL syntax conventions
-- Important domain-specific knowledge:
-  - "Entity" refers to "Entity" column
-  - In "Account Grouping": income includes "Other income" and "Revenue - Services"
-  - In "Account Grouping": expenses include "Dividend paid", "Other Overheads - Consultancy", "Other Overheads - G&A costs", "Other Overheads - Staff"
-  - Profile calculation: Income - Expenses
-  - Period Name comes as "Jan-25"
-  - long-term intercompany recivables defined as, 
-        1. In "Account Grouping" choose "Non current assets",
-        2. "Account Name" includes "Long term Inter company receivable"
- - When calculating change in expenses for entity,
-        1. In "Entity" for one "Month",
-        2. Sum up the "Closing Balance" where "Account" number starting from 6
 
 ## Output Format:
 You must respond with ONLY the SQL query without any additional text, explanations, or formatting.
@@ -328,8 +342,8 @@ You must respond with ONLY the SQL query without any additional text, explanatio
 
 USER QUERY: {user_query}
 
-DATABASE SCHEMA:
-{db_schema}
+DATABASE CONTEXT INDEX:
+{db_context_index}
 
 REASONING PLAN:
 {reasoning_plan}
@@ -350,27 +364,26 @@ This SQL query was generated to answer the question:
  
 The query returned {row_count} rows with these columns: {columns}
  
-Here's a sample of the data:
+Here's a the result:
 ```
 {data_sample}
 ```
  
-Please provide:
-1. A concise, conversational response that directly answers the user's question in natural language
-2. 2-3 key insights or observations from the data that would be valuable for business understanding
-3. Any relevant context or caveats about the financial interpretation
- 
+Please provide A concise, conversational response that directly answers the user's question in natural language in a suitable and clear format which is easy to read and understand. Use bullet points or lists where appropriate.
+
 Guidelines:
 - Use plain language that a business user without SQL knowledge would understand
 - Translate financial terms and concepts into everyday language
 - Be precise with numbers and calculations
+- The Currency is SAR, Use the correct currency symbol (SAR) and format
 - Format currency values properly
 - Highlight trends, comparisons, or noteworthy patterns
 - Keep your response concise and focused
 - Do not describe the SQL or database operations
 - Focus on the business meaning of the results
- 
-Your response should read as if a financial advisor is providing an analysis, not a technical explanation of data.
+
+Do not include any commentary about the SQL query, the data retrieval process or the results themselves.
+Your response should read as if a financial analyst is providing an answer to the user query, not a technical explanation of data.
 """
 
 def get_db_schema():
@@ -656,7 +669,7 @@ def create_minimal_context_index(error_msg):
     - Long-term intercompany receivables are in "Non current assets" with account names containing "Long term Inter company receivable"
     """
 
-def display_progress_steps(process_state):
+def display_progress_steps(process_state, user_query=None):
     """
     Display a visual representation of the processing steps using Streamlit native components
     """
@@ -670,6 +683,10 @@ def display_progress_steps(process_state):
     
     # Progress section title
     st.subheader("Processing your question...")
+    
+    # Display the user query during processing
+    if user_query:
+        st.markdown(f'<div style="background-color: #e1f5fe; padding: 10px; border-radius: 5px; margin-bottom: 15px; border-left: 4px solid #03a9f4;"><b>Query:</b> {user_query}</div>', unsafe_allow_html=True)
     
     # Progress bar
     progress_value = (process_state + 1) / len(steps)
@@ -726,13 +743,14 @@ def generate_reasoning(user_query, db_schema, db_context_index):
     
     return reasoning_plan, thinking_content
 
-def generate_sql_from_reasoning(user_query, db_schema, reasoning_plan, error_context=""):
+def generate_sql_from_reasoning(user_query, db_schema,db_context_index, reasoning_plan, error_context=""):
     """
     Uses the selected LLM to generate SQL based on the reasoning plan.
     """
     prompt = SQL_GENERATION_PROMPT.format(
         user_query=user_query,
         db_schema=db_schema,
+        db_context_index=db_context_index,
         reasoning_plan=reasoning_plan,
         error_context=error_context
     )
@@ -797,11 +815,12 @@ def generate_insights(user_query, sql_query, data):
    
     # Convert data to DataFrame for easier handling
     df = pd.DataFrame(data)
+    df_converted = df*-1
    
     # Convert DataFrame to a formatted string representation
-    data_sample = df.head(5).to_string()
-    row_count = len(df)
-    columns = ", ".join(list(df.columns))
+    data_sample = df_converted.head(5).to_string()
+    row_count = len(df_converted)
+    columns = ", ".join(list(df_converted.columns))
    
     prompt = RESULT_INTERPRETATION_PROMPT.format(
         user_query=user_query,
@@ -851,40 +870,40 @@ def create_chat_message(role, content, dataframe=None, reasoning=None):
             # If there's a dataframe, display it in an expander
             if dataframe is not None and not dataframe.empty:
                 with st.expander("View Data Table", expanded=False):
-                    st.dataframe(dataframe, use_container_width=True)
+                    st.dataframe(dataframe*-1, use_container_width=True)
 
-def display_model_info():
-    """
-    Display current model and token usage information
-    """
-    reasoning_models = ["o3", "o4-mini", "o3-mini"]
+# def display_model_info():
+#     """
+#     Display current model and token usage information
+#     """
+#     reasoning_models = ["o3", "o4-mini", "o3-mini"]
     
-    # Create a container for the model info
-    with st.expander("Model Information", expanded=False):
-        st.markdown(f'<div class="model-info-box">Currently using: <b>{st.session_state.model}</b></div>', unsafe_allow_html=True)
+#     # Create a container for the model info
+#     with st.expander("Model Information", expanded=False):
+#         st.markdown(f'<div class="model-info-box">Currently using: <b>{st.session_state.model}</b></div>', unsafe_allow_html=True)
         
-        if st.session_state.model in reasoning_models:
-            st.markdown(f'<div class="model-info-box">Reasoning Intensity: <b>{st.session_state.reasoning_effort}</b></div>', unsafe_allow_html=True)
-            st.info("""
-            **About Reasoning Models:**
-            Reasoning models like o4-mini and o3-mini "think before they answer," producing a long internal chain of thought.
-            - **Low intensity:** Favors speed and economical token usage
-            - **Medium intensity:** Balanced approach (recommended)
-            - **High intensity:** Favors more complete reasoning for complex problems
+#         if st.session_state.model in reasoning_models:
+#             st.markdown(f'<div class="model-info-box">Reasoning Intensity: <b>{st.session_state.reasoning_effort}</b></div>', unsafe_allow_html=True)
+#             st.info("""
+#             **About Reasoning Models:**
+#             Reasoning models like o4-mini and o3-mini "think before they answer," producing a long internal chain of thought.
+#             - **Low intensity:** Favors speed and economical token usage
+#             - **Medium intensity:** Balanced approach (recommended)
+#             - **High intensity:** Favors more complete reasoning for complex problems
             
-            Note: Reasoning tokens are billed as output tokens even though they're not visible in the response.
-            """)
+#             Note: Reasoning tokens are billed as output tokens even though they're not visible in the response.
+#             """)
         
-        # Add a note about token usage
-        if 'token_usage' in st.session_state and st.session_state.token_usage:
-            st.write("**Token Usage (Last Query):**")
-            st.write(f"- Input Tokens: {st.session_state.token_usage.get('input_tokens', 'N/A')}")
-            st.write(f"- Output Tokens: {st.session_state.token_usage.get('output_tokens', 'N/A')}")
+#         # Add a note about token usage
+#         if 'token_usage' in st.session_state and st.session_state.token_usage:
+#             st.write("**Token Usage (Last Query):**")
+#             st.write(f"- Input Tokens: {st.session_state.token_usage.get('input_tokens', 'N/A')}")
+#             st.write(f"- Output Tokens: {st.session_state.token_usage.get('output_tokens', 'N/A')}")
             
-            if st.session_state.model in reasoning_models and 'reasoning_tokens' in st.session_state.token_usage:
-                st.write(f"- Reasoning Tokens: {st.session_state.token_usage.get('reasoning_tokens', 'N/A')}")
+#             if st.session_state.model in reasoning_models and 'reasoning_tokens' in st.session_state.token_usage:
+#                 st.write(f"- Reasoning Tokens: {st.session_state.token_usage.get('reasoning_tokens', 'N/A')}")
             
-            st.write(f"- Total Tokens: {st.session_state.token_usage.get('total_tokens', 'N/A')}")
+#             st.write(f"- Total Tokens: {st.session_state.token_usage.get('total_tokens', 'N/A')}")
 
 def show_settings_page():
     """
@@ -931,7 +950,7 @@ def show_settings_page():
         - **High**: More thorough analysis for complex questions, uses more tokens
         """)
     else:
-        reasoning_effort = "medium"  # Default value for non-reasoning models
+        reasoning_effort = "high"  # Default value for non-reasoning models
     
     # Apply button
     if st.button("Apply Settings", type="primary"):
@@ -981,13 +1000,13 @@ def process_user_query(user_query):
         # Step 1: Analyze Query
         st.session_state.process_state = 0
         with progress_placeholder.container():
-            display_progress_steps(0)
+            display_progress_steps(0, user_query)  # Pass the user_query here
         time.sleep(0.5)  # Brief delay to allow UI update
         
         # Step 2: Generate Reasoning Plan
         st.session_state.process_state = 1
         with progress_placeholder.container():
-            display_progress_steps(1)
+            display_progress_steps(1, user_query)  # Pass the user_query here
         
         db_schema = get_db_schema()
         db_context_index = create_database_context_index()
@@ -997,41 +1016,38 @@ def process_user_query(user_query):
         with st.expander("View Reasoning Plan", expanded=True):
             st.markdown(f'<div class="reasoning-box">{reasoning_plan}</div>', unsafe_allow_html=True)
         
-        # Step 3: Generate SQL from Reasoning
+        # Step 3: Generate SQL from Reasoning (now using the pipeline with retry)
         st.session_state.process_state = 2
         with progress_placeholder.container():
-            display_progress_steps(2)
+            display_progress_steps(2, user_query)
         
-        sql_query, sql_thinking = generate_sql_from_reasoning(user_query, db_schema, reasoning_plan)
+        # Use the financial_data_pipeline instead of direct SQL generation and execution
+        pipeline_result = financial_data_pipeline(user_query)
         
-        # Display SQL query
-        with st.expander("View Generated SQL", expanded=False):
-            st.markdown(f'<div class="sql-box">{sql_query}</div>', unsafe_allow_html=True)
-       
-        # Step 4: Execute Query
-        st.session_state.process_state = 3
-        with progress_placeholder.container():
-            display_progress_steps(3)
-        data, error = execute_sql_query(sql_query)
-       
-        # Step 5: Interpret Results
-        st.session_state.process_state = 4
-        with progress_placeholder.container():
-            display_progress_steps(4)
-       
-        if data is not None:
-            df = pd.DataFrame(data)
-           
+        if pipeline_result["success"]:
+            # Step 4: Execute Query - already done in the pipeline
+            st.session_state.process_state = 3
+            with progress_placeholder.container():
+                display_progress_steps(3, user_query)
+            
+            # Step 5: Interpret Results
+            st.session_state.process_state = 4
+            with progress_placeholder.container():
+                display_progress_steps(4, user_query)
+            
+            # Convert data to DataFrame
+            df = pd.DataFrame(pipeline_result["data"])
+            
             # Generate natural language insights
-            insights = generate_insights(user_query, sql_query, data)
-           
+            insights = generate_insights(user_query, pipeline_result["sql_query"], pipeline_result["data"])
+            
             # Add AI message with insights and dataframe to chat history
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": insights,
                 "dataframe": df,
-                "sql_query": sql_query,
-                "reasoning": reasoning_plan
+                "sql_query": pipeline_result["sql_query"],
+                "reasoning": pipeline_result["reasoning_plan"]
             })
         else:
             # Handle error case
@@ -1039,17 +1055,17 @@ def process_user_query(user_query):
             I couldn't find an answer to your question. The database returned an error:
             
             ```
-            {error}
+            {pipeline_result["error"]}
             ```
             
             Could you try rephrasing your question?
             """
-           
+            
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": error_message,
-                "sql_query": sql_query,
-                "reasoning": reasoning_plan
+                "sql_query": pipeline_result["sql_query"],
+                "reasoning": pipeline_result["reasoning_plan"]
             })
     finally:
         # Reset processing state and clear progress display
@@ -1079,7 +1095,7 @@ def financial_data_pipeline(user_query, max_attempts=3):
         for attempt in range(max_attempts):
             if attempt > 0:
                 with progress_container.container():
-                    st.warning(f"🔄 Retrying with improved SQL (Attempt {attempt+1}/{max_attempts})")
+                    st.warning(f"🔄 Retrying with improved Logics (Attempt {attempt+1}/{max_attempts})")
            
             # Generate SQL with more specific error context after first attempt
             if attempt == 0:
@@ -1101,7 +1117,7 @@ def financial_data_pipeline(user_query, max_attempts=3):
     """
            
             # Generate SQL from reasoning plan
-            sql_query, sql_thinking = generate_sql_from_reasoning(user_query, db_schema, reasoning_plan, error_context)
+            sql_query, sql_thinking = generate_sql_from_reasoning(user_query, db_schema,db_context_index, reasoning_plan, error_context)
            
             # Execute SQL
             data, error = execute_sql_query(sql_query)
@@ -1113,7 +1129,8 @@ def financial_data_pipeline(user_query, max_attempts=3):
             # If we've exhausted all attempts, show an error
             if attempt == max_attempts - 1:
                 with progress_container.container():
-                    st.error("❌ All attempts failed. Could not generate a working SQL query.")
+                    # st.error("Error has .")
+                    st.error("I couldn't retrieve the data. Please check your query and try again.")
         
         return {
             "success": data is not None,
@@ -1155,29 +1172,31 @@ def main():
     page = st.sidebar.radio("Navigation", ["Chat", "Settings"])
     
     # Display model info in sidebar
-    with st.sidebar:
-        display_model_info()
+    # with st.sidebar:
+        # display_model_info()
     
     # Display the selected page
     if page == "Chat":
         # App header
+        st.image("vector_logo_1.png", width=450)
         st.title("Financial Insights Assistant 💰")
+        
         
         # Brief description
         st.info("""
-        Ask questions about your financial data in plain English. 
+        Ask questions about your financial data. 
         I'll analyze the data and provide insights with detailed reasoning.
         """)
         
         # Add example questions
-        with st.expander("Example questions you can ask"):
-            st.markdown("""
-            - What is the change in expenses for Entity 10101 in Jan-25?
-            - What's the total for long-term intercompany receivables of 10202 in Jan-25?
-            - Extract all long-term intercompany receivables grouped by entity
-            - Show me the top 5 entities by expenses in Jan-25
-            - Calculate the profit for each business line in Jan-25
-            """)
+        # with st.expander("Example questions you can ask"):
+        #     st.markdown("""
+        #     - What is the change in expenses for Entity 10101 in Jan-25?
+        #     - What's the total for long-term intercompany receivables of 10202 in Jan-25?
+        #     - Give comparison of profit, revenue, staff cost and G&A expenses for to 10101 for 2022, 2023
+        #     - Show me the top 5 entities by expenses in Jan-25
+        #     - Calculate the profit for each business line in Jan-25
+        #     """)
         
         # Display chat interface
         create_improved_chat_ui()
